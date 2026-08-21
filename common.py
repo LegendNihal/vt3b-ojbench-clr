@@ -6,6 +6,10 @@ Nothing in here needs a GPU. Scripts 2 and 4 use only this file.
 import hashlib
 import json
 import os
+
+# stage 2 forks subprocesses after the tokenizer has been used; without this
+# HF prints a fork warning for every single child
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import re
 import resource
 import shutil

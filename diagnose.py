@@ -43,6 +43,23 @@ def diagnose_candidates(path, show, tail_chars):
     print(f"  hit the token cap     : {n_cap}/{len(rows)} "
           f"({100*n_cap/len(rows):.0f}%)")
 
+    done = sorted(r.get("n_tokens", 0) for r in rows
+                  if r.get("finish") == "stop" and r.get("code"))
+    if done:
+        def pct(q):
+            return done[min(len(done) - 1, int(q * len(done)))]
+        print(f"\n  tokens used by rollouts that FINISHED with code ({len(done)} of them):")
+        print(f"    p50 {pct(.5)}   p75 {pct(.75)}   p90 {pct(.9)}   max {done[-1]}")
+        print("""
+  This is the number that sets your token budget. A cap a little above p90 keeps
+  almost every rollout that was ever going to succeed, and every token beyond it
+  is spent on rollouts that will be thrown away. Raising the cap past this point
+  buys very little and costs proportionally.""")
+        waste = sum(r.get("n_tokens", 0) for r in rows if r.get("finish") == "length")
+        total = sum(r.get("n_tokens", 0) for r in rows)
+        print(f"  tokens spent on truncated rollouts: {waste}/{total} "
+              f"({100*waste/max(total,1):.0f}% of all compute)")
+
     print("""
   How to read this:
     finish='length' + no code  -> the cap cut it off mid-thought. Raise

@@ -11,7 +11,7 @@ echo "== system packages =="
 apt-get update -qq
 # g++ compiles the C++ candidates; pypy3 is what OJBench itself uses for Python,
 # so verifying with plain CPython would give you the wrong TLE picture
-apt-get install -y -qq build-essential g++ pypy3 git curl python3-pip python-is-python3
+apt-get install -y -qq build-essential g++ pypy3 git curl
 
 echo "== python packages =="
 # these two versions are known to work together; vllm 0.6.3 pulls torch 2.4.0
@@ -22,6 +22,8 @@ pip install -q "numpy<2"
 # transformers needs jinja2>=3.1 for chat templates; some images ship 3.0.x
 pip install -q "jinja2>=3.1.4"
 pip install -q "huggingface_hub[cli]"
+# needed by ablate.py's transformers control run
+pip install -q "accelerate>=0.26.0"
 
 echo "== download the model (~6.2 GB) =="
 huggingface-cli download WeiboAI/VibeThinker-3B --local-dir /workspace/VibeThinker-3B

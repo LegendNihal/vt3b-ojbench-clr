@@ -39,13 +39,28 @@ def build_args():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--max-new-tokens", type=int, default=24576)
+    p.add_argument("--top-k", type=int, default=-1,
+                   help="-1 = off (the paper's setting). Set this if ablate.py says so")
+    p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--repetition-penalty", type=float, default=1.0)
+
     p.add_argument("--seed", type=int, default=1234)
 
     p.add_argument("--max-model-len", type=int, default=32768)
-    p.add_argument("--gpu-mem-util", type=float, default=0.90)
+    p.add_argument("--gpu-mem-util", type=float, default=0.93,
+                   help="eager mode frees the 1-3 GiB CUDA graphs would use, "
+                        "so this can go higher than the usual 0.90")
     p.add_argument("--max-num-seqs", type=int, default=48)
     p.add_argument("--swap-space", type=int, default=4)
     p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="re-enable CUDA graphs (~40%% faster). OFF by default: graph replay "
+                        "corrupts long generations on vllm 0.6.3 + Ada. See ablate.py")
+    p.add_argument("--no-async-output", action="store_true",
+                   help="disable async output processing. Try --cuda-graphs together with "
+                        "this if ablate.py says async output was the broken half")
+
     p.add_argument("--kv-cache-dtype", default="auto",
                    help="'fp8' roughly doubles KV capacity but needs a supported backend")
 
@@ -53,6 +68,10 @@ def build_args():
     p.add_argument("--datasets", default="NOI,ICPC")
     p.add_argument("--difficulties", default="easy,medium,hard")
     p.add_argument("--limit", type=int, default=0, help="first N tasks only (smoke tests)")
+    p.add_argument("--shuffle", action="store_true",
+                   help="shuffle (fixed seed) before --limit. full.jsonl is ordered by "
+                        "dataset, so an unshuffled --limit 8 is all NOI and tells you "
+                        "nothing about the ICPC half")
     p.add_argument("--shard", default="0/1")
 
     p.add_argument("--chunk", type=int, default=12, help="tasks per flush to disk")
@@ -77,6 +96,9 @@ def main():
              if t.get("language") in langs
              and t.get("dataset") in dsets
              and str(t.get("difficulty", "")).lower() in diffs]
+    if a.shuffle:
+        import random
+        random.Random(12345).shuffle(tasks)
     tasks = shard_filter(tasks, a.shard)
     if a.limit:
         tasks = tasks[: a.limit]
@@ -107,6 +129,10 @@ def main():
           + "=" * 70)
     print(render(todo[0])[:1200] + "\n... [truncated]\n" + "=" * 70 + "\n")
 
+    if not a.cuda_graphs:
+        print("[engine] CUDA graphs disabled (default). Graph replay corrupts long "
+              "generations on vllm 0.6.3 + Ada; measured cost ~25% throughput. "
+              "Pass --cuda-graphs to override (do not, unless ablate.py says otherwise).")
     llm = LLM(
         model=a.model,
         dtype="bfloat16",
@@ -115,6 +141,8 @@ def main():
         max_num_seqs=a.max_num_seqs,
         swap_space=a.swap_space,
         enable_prefix_caching=not a.no_prefix_caching,
+        enforce_eager=not a.cuda_graphs,
+        disable_async_output_proc=a.no_async_output,
         kv_cache_dtype=a.kv_cache_dtype,
         trust_remote_code=True,
         seed=a.seed,
@@ -134,7 +162,8 @@ def main():
                 budget = max(budget, 512)
             prompts.append(text)
             sps.append(SamplingParams(
-                n=a.k, temperature=a.temperature, top_p=a.top_p, top_k=-1,
+                n=a.k, temperature=a.temperature, top_p=a.top_p, top_k=a.top_k,
+                min_p=a.min_p, repetition_penalty=a.repetition_penalty,
                 max_tokens=min(a.max_new_tokens, budget), seed=a.seed + c0,
             ))
 

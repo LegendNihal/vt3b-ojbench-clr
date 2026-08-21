@@ -110,9 +110,20 @@ scp -P <port> OJBench_testdata/prompts/full.jsonl root@<host>:~/vt3b-ojbench-clr
 
 ---
 
-## Smoke test first (~10 minutes)
+## Smoke test first (~30-40 minutes)
 
-Never start an 8-hour run without this.
+Never start an overnight run without this. One command exercises all four stages on a few
+problems and then prints the numbers that decide whether the full run is worth starting:
+
+```bash
+MODEL=/workspace/VibeThinker-3B PROMPTS=full.jsonl bash smoke.sh
+```
+
+It checks: code-block rate (want > 80%), how many tasks split into more than one behaviour
+(clustering is dead if this is 0), the distribution of selection modes, and the CLR verdict
+parse rate. Each failing check prints what to change.
+
+Or run the stages by hand:
 
 ```bash
 python 1_generate.py --model /workspace/VibeThinker-3B --prompts full.jsonl \
@@ -163,18 +174,60 @@ python 1_generate.py --model /workspace/VibeThinker-3B --prompts full.jsonl \
        --out work/candidates.jsonl --k 16 --max-model-len 32768 --max-new-tokens 24576
 ```
 
-Rough budget on one 4090 for all 464 tasks:
+## Budgeting the run
 
-| stage | K=8 | K=16 |
-|---|---|---|
-| 1 generate | 3–5 h | 6–10 h |
-| 2 verify (CPU) | 20–40 min | 30–60 min |
-| 3 CLR | 1–1.5 h | 1.5–2.5 h |
+Measure before committing. A smoke run of 8 tasks x K=4 took 16.5 minutes at 609 tok/s with
+~18,800 tokens per sample, which extrapolates to **~32 h at K=8 and ~64 h at K=16** for all
+464 tasks. That is not viable on one 4090, and the fix is not patience -- it is that most of
+those tokens are being thrown away.
 
-Stage 1 prints a live ETA after the first chunk — trust that over this table. Two rented GPUs
-halve it: run `--shard 0/2` and `--shard 1/2` and `cat` the two candidate files together.
+**Step 1: find out what a successful rollout costs.**
 
-**VRAM.** Weights are 6.2 GB. The KV cache costs ~36 KB/token (36 layers × 2 KV heads ×
+```bash
+python diagnose.py --candidates work/smoke/cand.jsonl --prompts full.jsonl
+```
+
+Section A now prints the p50/p75/p90 token count of rollouts that *finished and produced code*,
+plus the share of total compute spent on truncated ones. Truncated rollouts yield nothing --
+no code block, so they never enter the candidate pool -- and they are the most expensive
+samples in the run, because each one burns the full cap.
+
+Set `--max-new-tokens` a little above that p90. Beyond it you are paying for rollouts that were
+never going to finish. Below it you are cutting off ones that would have.
+
+**Step 2: check whether fp8 KV cache buys you concurrency.**
+
+Throughput here is bound by KV cache, not compute: 22781 blocks = 364k tokens, so at a 26k cap
+only ~14 sequences fit and a 3B model is nowhere near compute-bound at batch 14. fp8 roughly
+doubles capacity. The catch is that vLLM falls back to a scaling factor of 1.0 when the
+checkpoint ships no calibration, which can quietly degrade quality -- so measure it the same
+way the CUDA graph bug was found:
+
+```bash
+python ablate.py --configs speed --max-tokens 14000
+```
+
+That compares `eager`, `eager_fp8` and `eager_mem95` on both degeneracy and tok/s. Take fp8
+only if `deg_tail` stays under ~0.3. If it does, add `--kv-cache-dtype fp8` and raise
+`--max-num-seqs` to match the new capacity.
+
+**Step 3: pick K against the measured rate.** Once stage 1 prints its ETA after the first
+chunk, that number is real. Options, roughly in order of preference:
+
+* Shard across two or three rented GPUs: `--shard 0/2` and `--shard 1/2`, then `cat` the
+  candidate files. Linear and safe.
+* Drop to K=4. Best-of-4 with a working execution gate still beats pass@1 comfortably; the
+  gain from K is logarithmic, the cost is linear.
+* Trim the token cap per step 1.
+
+Do not shrink the benchmark. A score on a subset is not comparable to the paper's 38.6.
+
+**Watch for KV pressure.** `Sequence group N is preempted by PreemptionMode.SWAP` means vLLM
+admitted more sequences than the cache holds and is shuffling KV to host memory. A couple is
+fine; a stream of them means `--max-num-seqs` is above real capacity. Capacity is roughly
+364k / your token cap, so at a 16k cap that is ~22 sequences.
+
+**VRAM.****VRAM.** Weights are 6.2 GB. The KV cache costs ~36 KB/token (36 layers × 2 KV heads ×
 128 dim × 2 for K and V × 2 bytes), so at `--gpu-mem-util 0.90` you get roughly 14 GB of
 cache ≈ 390k tokens ≈ a dozen concurrent 32K sequences. That is comfortable. If you hit OOM,
 drop `--max-num-seqs` to 24 before touching anything else.
@@ -262,24 +315,62 @@ budget is too tight for this model -- it is a long-CoT reasoner and the model ca
 ## Troubleshooting
 
 **Generations come out as word salad.** Short broken lines, stray rare tokens, random language
-switching, `finish='stop'` well under the cap. This is a corrupted decode, not a prompt
-problem, and it is usually intermittent -- some rollouts in the same batch are fine. Run:
+switching, `finish='stop'` well under the cap. It appears **partway through** a long
+generation -- the opening is coherent and the text rots after several thousand tokens -- so a
+short test comes back clean and proves nothing. `ablate.py` runs 14000 tokens for that reason.
 
 ```bash
 python ablate.py --model /workspace/VibeThinker-3B --prompts full.jsonl
 ```
 
-It re-runs one real prompt under transformers alone and under several vLLM configurations,
-each in its own subprocess, and scores each for degeneracy (`< 0.3` healthy, `> 0.5` salad).
-Read the table top-down and take the first clean row:
+On a 4090 with `vllm==0.6.3.post1` this was measured to be **CUDA graph replay corruption**:
 
-* `hf_baseline` also bad -> the weights, the prompt or the sampling params, not vLLM.
-* `no_prefix_cache` clean -> pass `--no-prefix-caching` to stages 1 and 3. Prefix caching with
-  `n > 1` shares blocks between forked sequences and had known correctness bugs in this vLLM.
-* `no_async_out` or `eager` clean -> add the matching flag; CUDA graph or async output
-  corruption.
-* only `greedy` / `temp_0.6` clean -> sampling instability; drop temperature, and note in your
-  write-up that you deviated from the paper's `temperature=1.0`.
+```
+config            deg_all  deg_tail     bad   1st_bad
+hf_baseline         0.081     0.021     0/2        -     <- transformers is fine
+vllm_default        0.457     0.546     3/6      8.6
+no_prefix_cache     0.457     0.546     3/6      8.6     <- identical, so not prefix caching
+eager               0.079     0.105     0/6        -     <- the fix
+greedy              0.688     0.727     2/2      7.0     <- worst, so not sampling
+```
+
+`greedy` is the load-bearing row. It is deterministic, so if sampling were the cause it would
+be the *cleanest*; instead it is the worst, and every sampling variant (temp 0.6/0.8, top-k 50,
+top-p 0.9, min-p, repetition penalty) is equally broken. That rules sampling out entirely,
+which is worth knowing: it means you keep the paper's `temperature=1.0, top_p=0.95, top_k=-1`
+and the run stays comparable.
+
+**So CUDA graphs are off by default in stages 1, 2c and 3.** It costs about 40% throughput and
+the scripts print a line saying so. A silently corrupted 8-hour run is much worse than a slow
+one.
+
+`enforce_eager` disables two things at once -- vLLM logs *"Since enforce-eager is enabled,
+async output processor cannot be used"* -- so `--configs engine` was run to separate them:
+
+```
+config            deg_all  deg_tail     bad   1st_bad
+vllm_default        0.457     0.546     3/6      8.6
+eager               0.079     0.105     0/6        -
+no_async_out        0.457     0.546     3/6      8.6
+graphs_no_async     0.457     0.546     3/6      8.6
+```
+
+All three graph-enabled rows are bit-identical regardless of async output and prefix caching,
+so it is the graphs themselves. Async output processing is not implicated and there is no
+throughput to win back. Measured penalty was 335 vs 447 tok/s (~25%) at six concurrent
+sequences; eager overhead is per-step kernel launch cost, so it amortises better at the larger
+batch a real run uses. Leave the defaults alone.
+
+Other patterns, if your table looks different from the one above:
+
+* **`1st_bad` at the same position in every config, including eager** -> positional. Check
+  `rope_scaling` and `max_position_embeddings` in `config.json`, and try a lower `--max-model-len`.
+* **`hf_baseline` also bad** -> not vLLM at all; the weights or the prompt.
+
+**A degenerate rollout is not fatal, it is just wasted.** It produces no code block, so it never
+enters the candidate pool. Watch the `N/M had a code block` counter stage 1 prints per chunk: if
+it settles well below ~80%, raise `--k` to compensate, because that fraction is your effective
+sample count.
 
 
 **Context beyond 32K.** Qwen2.5-Coder-3B declares `max_position_embeddings: 32768`, and the

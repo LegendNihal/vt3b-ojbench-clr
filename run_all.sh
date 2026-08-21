@@ -10,20 +10,26 @@ MAXLEN=${MAXLEN:-32768}
 WORKERS=${WORKERS:-8}          # CPU threads for the sandbox
 BASELINE_ROLLOUTS=${BASELINE_ROLLOUTS:-8}
 N_INPUTS=${N_INPUTS:-6}      # generated inputs per problem
+# whatever ablate.py found, e.g. SAMPLING="--top-k 50" or "--min-p 0.05" or "--temperature 0.6"
+SAMPLING=${SAMPLING:-}
+# engine flags. Default (empty) = CUDA graphs OFF, which is the safe config.
+# If ablate.py --configs engine shows no_async_out is clean, use:
+#   ENGINE="--cuda-graphs --no-async-output"   for ~40% more throughput
+ENGINE=${ENGINE:-}
 
 mkdir -p work logs
 
 echo "### stage 1: generating ${K} candidates per task"
 python 1_generate.py \
   --model "$MODEL" --prompts "$PROMPTS" --out work/candidates.jsonl \
-  --k "$K" --max-model-len "$MAXLEN" --max-new-tokens $((MAXLEN - 6144)) \
+  --k "$K" --max-model-len "$MAXLEN" --max-new-tokens $((MAXLEN - 6144)) $SAMPLING $ENGINE \
   2>&1 | tee -a logs/1_generate.log
 
 echo "### stage 2c: input generators (OJBench strips NOI samples, so this is"
 echo "###            the only execution signal on 159 of the 232 problems)"
 python 2c_gen_inputs.py \
   --model "$MODEL" --prompts "$PROMPTS" --out work/stress.jsonl \
-  --n-inputs "$N_INPUTS" --max-model-len "$MAXLEN" \
+  --n-inputs "$N_INPUTS" --max-model-len "$MAXLEN" $SAMPLING $ENGINE \
   2>&1 | tee -a logs/2c_gen.log
 
 echo "### stage 2: execution gate + behavioural signatures"
@@ -36,7 +42,7 @@ echo "### stage 3: claim-level reliability assessment"
 python 3_clr_rank.py \
   --model "$MODEL" --prompts "$PROMPTS" \
   --candidates work/candidates.jsonl --verify work/verify.jsonl \
-  --out work/selection.jsonl --top-n "$TOPN" --max-model-len "$MAXLEN" \
+  --out work/selection.jsonl --top-n "$TOPN" --max-model-len "$MAXLEN" $SAMPLING $ENGINE \
   2>&1 | tee -a logs/3_clr.log
 
 echo "### stage 4: building submissions"

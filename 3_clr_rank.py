@@ -102,12 +102,26 @@ def build_args():
     p.add_argument("--verify-tokens", type=int, default=12288)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--top-k", type=int, default=-1,
+                   help="-1 = off (the paper's setting). Set this if ablate.py says so")
+    p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--repetition-penalty", type=float, default=1.0)
+
     p.add_argument("--seed", type=int, default=7)
 
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
     p.add_argument("--max-num-seqs", type=int, default=64)
     p.add_argument("--kv-cache-dtype", default="auto")
+    p.add_argument("--no-prefix-caching", action="store_true")
+    p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="re-enable CUDA graphs (~40%% faster). OFF by default: graph replay "
+                        "corrupts long generations on vllm 0.6.3 + Ada. See ablate.py")
+    p.add_argument("--no-async-output", action="store_true",
+                   help="disable async output processing. Try --cuda-graphs together with "
+                        "this if ablate.py says async output was the broken half")
+
 
     # scoring knobs
     p.add_argument("--gate-pass", type=float, default=1.0, help="weight when all samples pass")
@@ -219,7 +233,9 @@ def main():
         tok = load_tokenizer(a.model)
         llm = LLM(model=a.model, dtype="bfloat16", max_model_len=a.max_model_len,
                   gpu_memory_utilization=a.gpu_mem_util, max_num_seqs=a.max_num_seqs,
-                  swap_space=4, enable_prefix_caching=True,
+                  swap_space=4, enable_prefix_caching=not a.no_prefix_caching,
+                  enforce_eager=not a.cuda_graphs,
+                  disable_async_output_proc=a.no_async_output,
                   kv_cache_dtype=a.kv_cache_dtype, trust_remote_code=True, seed=a.seed)
 
         def chat(prompts, max_tokens):
@@ -228,7 +244,9 @@ def main():
             for t in texts:
                 room = a.max_model_len - len(tok(t)["input_ids"]) - 16
                 sps.append(SamplingParams(n=1, temperature=a.temperature, top_p=a.top_p,
-                                          top_k=-1, max_tokens=max(256, min(max_tokens, room)),
+                                          top_k=a.top_k, min_p=a.min_p,
+                                          repetition_penalty=a.repetition_penalty,
+                                          max_tokens=max(256, min(max_tokens, room)),
                                           seed=a.seed))
             return [o.outputs[0].text for o in llm.generate(texts, sps)]
 

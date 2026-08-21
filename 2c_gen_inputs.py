@@ -61,9 +61,21 @@ def build_args():
     p.add_argument("--statement-chars", type=int, default=12000)
     p.add_argument("--max-tokens", type=int, default=6144)
     p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--top-k", type=int, default=-1,
+                   help="-1 = off (the paper's setting). Set this if ablate.py says so")
+    p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--repetition-penalty", type=float, default=1.0)
+
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
     p.add_argument("--max-num-seqs", type=int, default=64)
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="re-enable CUDA graphs (~40%% faster). OFF by default: graph replay "
+                        "corrupts long generations on vllm 0.6.3 + Ada. See ablate.py")
+    p.add_argument("--no-async-output", action="store_true",
+                   help="disable async output processing. Try --cuda-graphs together with "
+                        "this if ablate.py says async output was the broken half")
+
     p.add_argument("--gen-timeout", type=float, default=10.0)
     p.add_argument("--max-input-bytes", type=int, default=65536)
     p.add_argument("--limit", type=int, default=0)
@@ -92,7 +104,8 @@ def main():
     llm = LLM(model=a.model, dtype="bfloat16", max_model_len=a.max_model_len,
               gpu_memory_utilization=a.gpu_mem_util, max_num_seqs=a.max_num_seqs,
               swap_space=4, enable_prefix_caching=True, trust_remote_code=True,
-              seed=a.seed)
+              enforce_eager=not a.cuda_graphs,
+              disable_async_output_proc=a.no_async_output, seed=a.seed)
 
     texts, sps = [], []
     for t in targets:
@@ -100,7 +113,8 @@ def main():
         rendered = render_chat(tok, PROMPT.format(statement=stmt))
         room = a.max_model_len - len(tok(rendered)["input_ids"]) - 16
         texts.append(rendered)
-        sps.append(SamplingParams(n=1, temperature=a.temperature, top_p=0.95, top_k=-1,
+        sps.append(SamplingParams(n=1, temperature=a.temperature, top_p=0.95, top_k=a.top_k,
+                                  min_p=a.min_p, repetition_penalty=a.repetition_penalty,
                                   max_tokens=max(512, min(a.max_tokens, room)), seed=a.seed))
 
     outs = llm.generate(texts, sps)
