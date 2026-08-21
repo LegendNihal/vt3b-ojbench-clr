@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Full pipeline on the vast.ai box. Edit the knobs, then: bash run_all.sh
+set -euo pipefail
+
+MODEL=${MODEL:-/workspace/VibeThinker-3B}
+PROMPTS=${PROMPTS:-OJBench_testdata/prompts/full.jsonl}
+K=${K:-16}                     # candidates per task
+TOPN=${TOPN:-6}                # programs per task that get the CLR treatment
+MAXLEN=${MAXLEN:-32768}
+WORKERS=${WORKERS:-8}          # CPU threads for the sandbox
+BASELINE_ROLLOUTS=${BASELINE_ROLLOUTS:-8}
+
+mkdir -p work logs
+
+echo "### stage 1: generating ${K} candidates per task"
+python 1_generate.py \
+  --model "$MODEL" --prompts "$PROMPTS" --out work/candidates.jsonl \
+  --k "$K" --max-model-len "$MAXLEN" --max-new-tokens $((MAXLEN - 6144)) \
+  2>&1 | tee -a logs/1_generate.log
+
+echo "### stage 2: execution gate on the statement samples"
+python 2_verify_samples.py \
+  --prompts "$PROMPTS" --candidates work/candidates.jsonl \
+  --out work/verify.jsonl --workers "$WORKERS" \
+  2>&1 | tee -a logs/2_verify.log
+
+echo "### stage 3: claim-level reliability assessment"
+python 3_clr_rank.py \
+  --model "$MODEL" --prompts "$PROMPTS" \
+  --candidates work/candidates.jsonl --verify work/verify.jsonl \
+  --out work/selection.jsonl --top-n "$TOPN" --max-model-len "$MAXLEN" \
+  2>&1 | tee -a logs/3_clr.log
+
+echo "### stage 4: building submissions"
+python 4_build_response.py --prompts "$PROMPTS" --mode clr \
+  --out model_response_clr.jsonl
+
+for i in $(seq 0 $((BASELINE_ROLLOUTS - 1))); do
+  python 4_build_response.py --prompts "$PROMPTS" --mode single --take-idx "$i" \
+    --out "model_response_base_${i}.jsonl" >/dev/null
+done
+echo "baseline files: model_response_base_0..$((BASELINE_ROLLOUTS - 1)).jsonl"
+
+echo
+echo "Done. Copy these to the judge machine:"
+ls -la model_response_clr.jsonl model_response_base_*.jsonl
