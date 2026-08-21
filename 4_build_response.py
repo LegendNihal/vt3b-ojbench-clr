@@ -29,6 +29,10 @@ from common import read_jsonl, task_key, wrap_as_content, write_jsonl
 
 PLACEHOLDER = "The model did not produce a usable program for this task."
 
+# what the OJBench README documents for a model response line
+OJBENCH_FIELDS = {"id", "prompt", "dataset", "language", "difficulty", "content"}
+OJBENCH_REQUIRED = {"id", "content"}      # the judge only needs these two
+
 
 def build_args():
     p = argparse.ArgumentParser()
@@ -40,7 +44,7 @@ def build_args():
     p.add_argument("--take-idx", type=int, default=0, help="rollout index for --mode single")
     p.add_argument("--content-mode", choices=["code", "raw"], default="code")
     p.add_argument("--schema-from", default=None,
-                   help="your known-good model_response.jsonl; keys are compared against it")
+                   help="optional: another model_response.jsonl to compare keys against")
     p.add_argument("--keep-fields", default=None,
                    help="comma-separated field whitelist (default: everything in full.jsonl)")
     return p.parse_args()
@@ -87,7 +91,26 @@ def main():
     print(f"  with a program: {stat['ok']} | placeholder: {stat['missing']}")
     print(f"  fields: {sorted(rows[0].keys()) if rows else '-'}")
 
-    if a.schema_from:
+    if rows:
+        have = set(rows[0].keys())
+        missing_req = OJBENCH_REQUIRED - have
+        missing_doc = OJBENCH_FIELDS - have
+        if missing_req:
+            print(f"\n[schema] FAIL: the judge needs {sorted(missing_req)}")
+        elif missing_doc:
+            print(f"\n[schema] ok for judging, but the README also lists "
+                  f"{sorted(missing_doc)}")
+        else:
+            print("\n[schema] matches the OJBench README: "
+                  f"{sorted(OJBENCH_FIELDS)}")
+        extra = have - OJBENCH_FIELDS
+        if extra:
+            print(f"[schema] extra fields carried over from full.jsonl "
+                  f"(harmless): {sorted(extra)}")
+
+    if a.schema_from and not Path(a.schema_from).exists():
+        print(f"[schema] --schema-from {a.schema_from} does not exist, skipping")
+    elif a.schema_from:
         ref = read_jsonl(a.schema_from)
         if ref:
             rk, mk = set(ref[0].keys()), set(rows[0].keys())

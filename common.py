@@ -149,6 +149,46 @@ def _block_after(text, start):
     return "\n".join(out), False
 
 
+_BARE_IN = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Input|输入)[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
+_BARE_OUT = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Output|输出)[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
+_EXAMPLE_HDR = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Example|Sample|样例|例)s?[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
+_FENCE_BLOCK = re.compile(r"```[A-Za-z0-9_+#.\-]*[ \t]*\r?\n(.*?)```", re.S)
+
+
+def _parse_bare_pairs(prompt):
+    """`#### Input` / `#### Output` headings. Fenced payloads only -- an unfenced
+    one is far more likely to be the *format description* than sample data."""
+    hits = [("in", m.end()) for m in _BARE_IN.finditer(prompt)]
+    hits += [("out", m.end()) for m in _BARE_OUT.finditer(prompt)]
+    hits.sort(key=lambda x: x[1])
+    pairs, i = [], 0
+    while i < len(hits) - 1:
+        if hits[i][0] == "in" and hits[i + 1][0] == "out":
+            a, fa = _block_after(prompt, hits[i][1])
+            b, fb = _block_after(prompt, hits[i + 1][1])
+            if fa and fb and a.strip() and b.strip():
+                pairs.append({"input": a.rstrip() + "\n", "output": b.rstrip() + "\n",
+                              "fenced": True})
+            i += 2
+        else:
+            i += 1
+    return pairs
+
+
+def _parse_example_section(prompt):
+    """An `### Example` heading followed by exactly two fenced blocks."""
+    pairs = []
+    for m in _EXAMPLE_HDR.finditer(prompt):
+        rest = prompt[m.end():]
+        nxt = _EXAMPLE_HDR.search(rest)
+        chunk = rest[: nxt.start()] if nxt else rest[:4000]
+        blocks = _FENCE_BLOCK.findall(chunk)
+        if len(blocks) == 2 and blocks[0].strip() and blocks[1].strip():
+            pairs.append({"input": blocks[0].rstrip() + "\n",
+                          "output": blocks[1].rstrip() + "\n", "fenced": True})
+    return pairs
+
+
 def parse_samples(prompt):
     """Return [{'input': str, 'output': str}, ...] parsed from a statement."""
     if not prompt:
@@ -168,6 +208,11 @@ def parse_samples(prompt):
             i += 2
         else:
             i += 1
+    if not pairs:
+        pairs = _parse_bare_pairs(prompt)
+    if not pairs:
+        pairs = _parse_example_section(prompt)
+
     # de-duplicate while preserving order
     seen, uniq = set(), []
     for p in pairs:
@@ -288,16 +333,21 @@ def compile_cpp(code, workdir, std="c++17"):
 
 
 def run_candidate_on_tests(code, language, tests, workdir, timeout_s=10.0,
-                           mem_mb=1024, py_cmd=None):
-    """Run one candidate over a list of {'input','output'} tests.
+                           mem_mb=1024, py_cmd=None, extra_inputs=None):
+    """Run one candidate over `tests` (inputs with expected outputs) and over
+    `extra_inputs` (generated inputs with no expected output).
 
-    Returns {'compile_error', 'results': [...], 'signature': str, 'n_pass', 'n_total'}.
-    `signature` is a hash of the produced stdout across all tests -- two candidates
-    with the same signature behave identically on everything we ran.
+    `tests` drive the pass/fail gate. `extra_inputs` exist for differential
+    testing: they never affect n_pass, but they do feed the signature, which is
+    what clusters candidates by behaviour. On OJBench's NOI half there are no
+    statement samples at all, so these inputs are the only clustering signal
+    there is -- and the only thing that ever executes a Python candidate.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    out = {"compile_error": None, "results": [], "n_pass": 0, "n_total": len(tests)}
+    extra_inputs = extra_inputs or []
+    out = {"compile_error": None, "results": [], "n_pass": 0, "n_total": len(tests),
+           "stress_status": [], "n_stress": len(extra_inputs)}
 
     if language == "cpp":
         exe, err = compile_cpp(code, workdir)
@@ -307,6 +357,12 @@ def run_candidate_on_tests(code, language, tests, workdir, timeout_s=10.0,
             return out
         argv, apply_as = [exe], True
     else:
+        try:                       # free correctness gate when there are no tests
+            compile(code, "main.py", "exec")
+        except SyntaxError as e:
+            out["compile_error"] = f"SyntaxError: {e}"
+            out["signature"] = "CE"
+            return out
         src = workdir / "main.py"
         src.write_text(code, encoding="utf-8")
         interp = py_cmd or find_pypy3() or sys.executable
@@ -325,6 +381,12 @@ def run_candidate_on_tests(code, language, tests, workdir, timeout_s=10.0,
         stdouts.append(f"{r['status']}\x01{norm_output(r['stdout'])}")
         if ok:
             out["n_pass"] += 1
+
+    for inp in extra_inputs:
+        r = run_program(argv, inp, timeout_s=timeout_s, mem_mb=mem_mb,
+                        cwd=str(workdir), apply_as=apply_as)
+        out["stress_status"].append(r["status"])
+        stdouts.append(f"{r['status']}\x01{norm_output(r['stdout'])}")
 
     out["signature"] = hashlib.sha1("\x02".join(stdouts).encode("utf-8", "replace")).hexdigest()[:16]
     return out
@@ -359,17 +421,33 @@ def load_tokenizer(model):
     return tok
 
 
+def _chatml_render(user_text):
+    """Render ChatML by hand. No jinja2, no transformers, no template compilation."""
+    return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+
+
 def render_chat(tok, user_text):
+    if tok is None:
+        return _chatml_render(user_text)
     try:
         return tok.apply_chat_template(
             [{"role": "user", "content": user_text}],
             tokenize=False, add_generation_prompt=True)
+    except ImportError as e:
+        # transformers needs jinja2>=3.1.0 to compile a template; some base images ship 3.0.x
+        print(f"[tokenizer] {e}")
+        print("[tokenizer] falling back to a jinja-free ChatML renderer. "
+              "Run `pip install -U 'jinja2>=3.1.4'` to use the model's own template instead.")
+        return _chatml_render(user_text)
     except Exception as e:
         print(f"[tokenizer] apply_chat_template failed ({e}); using the ChatML fallback")
         tok.chat_template = CHATML_FALLBACK
-        return tok.apply_chat_template(
-            [{"role": "user", "content": user_text}],
-            tokenize=False, add_generation_prompt=True)
+        try:
+            return tok.apply_chat_template(
+                [{"role": "user", "content": user_text}],
+                tokenize=False, add_generation_prompt=True)
+        except Exception:
+            return _chatml_render(user_text)
 
 
 # --------------------------------------------------------------------------
@@ -400,6 +478,37 @@ def parse_last_json(text):
         except json.JSONDecodeError:
             continue
     return None
+
+
+def parse_verdicts(text, m=5):
+    """Pull M binary verdicts out of a verification response.
+
+    Tries strict JSON first, then a couple of looser patterns, because a long
+    reasoning trace that gets truncated often loses its closing brace but still
+    shows the verdict list.
+    """
+    js = parse_last_json(text)
+    if isinstance(js, dict) and isinstance(js.get("verdicts"), list):
+        return _norm_verdicts(js["verdicts"], m), str(js.get("worst_issue", ""))[:300]
+
+    hit = re.findall(r'verdicts"?\s*[:=]\s*\[([^\]]*)\]', text or "", re.I)
+    if not hit:
+        hit = re.findall(r"\[\s*(?:[01]\s*,\s*){%d,}[01]\s*\]" % (m - 2), text or "")
+        hit = [h.strip("[]") for h in hit]
+    if hit:
+        parts = [x.strip().strip('"') for x in hit[-1].split(",")]
+        vs = _norm_verdicts(parts, m)
+        if vs:
+            return vs, ""
+    return None, ""
+
+
+def _norm_verdicts(raw, m):
+    vs = [1 if str(x).strip().strip('"').lower() in ("1", "true", "yes") else 0 for x in raw][:m]
+    if not vs:
+        return None
+    vs += [0] * (m - len(vs))
+    return vs
 
 
 def shard_filter(items, shard):

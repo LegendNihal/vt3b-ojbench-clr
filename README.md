@@ -25,6 +25,17 @@ printed in the statement are exactly what a human contestant sees before submitt
 program that fails them is dead no matter how confident the model sounds. So execution is a
 gate in front of CLR, not a competitor to it.
 
+There is a catch, and it dominates the design: **OJBench strips the sample tests out of the
+NOI statements.** Run `diagnose.py` and you will see `### Example` headings with nothing under
+them, and the prompt itself saying *"do not directly test on the sample inputs"*. Coverage
+comes out around ICPC 93%, NOI 10% -- so for 159 of the 232 problems there is nothing to
+execute, every candidate hashes to the same signature, and clustering collapses to a single
+group. `2c_gen_inputs.py` exists for exactly this: the model writes a small input *generator*
+per problem, and candidates are compared against each other on those inputs. No expected
+output is needed. Two programs that disagree on a valid input cannot both be right, and the
+larger agreeing group is the better bet. It is also the only thing that ever executes a Python
+candidate on the NOI half, which is why a syntax check now runs there too.
+
 > The hidden testdata under `OJBench_testdata/NOI/` and `ICPC/` is **never** read by this
 > pipeline. Selecting on hidden tests would make the resulting number meaningless.
 
@@ -53,12 +64,17 @@ bonus, since a behaviour that 9 of 16 rollouts agree on is more likely right tha
 vast.ai 4090 (24 GB)                          your WSL2 box
 ─────────────────────                          ─────────────
 1_generate.py     GPU, the long one            OJBench judge server
-2_verify_samples  CPU, needs g++ + pypy3       (already working)
+2c_gen_inputs.py  GPU, ~15 min                 (already working)
+2_verify_samples  CPU, needs g++ + pypy3
 3_clr_rank.py     GPU
 4_build_response  CPU
         │
         └── model_response_clr.jsonl ──scp──▶ judge_jsonl() ──▶ judged.jsonl
 ```
+
+Helper scripts: `diagnose.py` (why are there no code blocks / no samples),
+`ablate.py` (why is the model producing word salad), `2b_extract_samples.py`
+(optional, rarely useful given the NOI situation above).
 
 You need `OJBench_testdata/prompts/full.jsonl` on the vast.ai box (just that one file, a few
 MB — not the test data). The `content` strings this writes are single clean fenced code
@@ -110,8 +126,7 @@ python 3_clr_rank.py --model /workspace/VibeThinker-3B --prompts full.jsonl \
        --out work/smoke_sel.jsonl --top-n 2
 
 python 4_build_response.py --prompts full.jsonl --candidates work/smoke_cand.jsonl \
-       --selection work/smoke_sel.jsonl --out smoke.jsonl \
-       --schema-from /path/to/your/working_synthetic.jsonl
+       --selection work/smoke_sel.jsonl --out smoke.jsonl
 ```
 
 Four things to check:
@@ -122,8 +137,9 @@ Four things to check:
    against the real statements — this is the single highest-leverage thing to verify.
 3. Stage 3 prints how many claim sets and verdict sets parsed. Below ~70% means the model is
    running out of tokens before it emits the JSON; raise `--extract-tokens` / `--verify-tokens`.
-4. Stage 4's `--schema-from` compares field names against your known-good file and tells you
-   about any mismatch.
+4. Stage 4 validates its own output against the schema in the OJBench README
+   (`id`, `prompt`, `dataset`, `language`, `difficulty`, `content`) and prints the verdict.
+   `--schema-from` is optional and only there if you want to diff against another file.
 
 Then judge `smoke.jsonl` on WSL2 to confirm the round trip works before committing GPU hours.
 
@@ -134,6 +150,9 @@ Then judge `smoke.jsonl` on WSL2 to confirm the round trip works before committi
 ```bash
 MODEL=/workspace/VibeThinker-3B PROMPTS=full.jsonl K=16 bash run_all.sh
 ```
+
+Do not skip stage 2c. Without it the pipeline has no execution evidence at all on 68% of the
+benchmark and degenerates into "trust the claim verifier", which is much weaker.
 
 Or stage by stage, which is what I'd do — stage 1 resumes cleanly if it dies, so run it under
 `tmux`:
@@ -219,20 +238,49 @@ want the extra point, but then say so.
 | `--alpha` | 0.25 | weight on self-consistency vs. claim reliability |
 | `--no-llm` (stage 3) | off | skip CLR entirely: execution gate + majority vote. Useful ablation |
 
-Check how often the model ran out of room to think:
+## diagnose.py
+
+Run this whenever something looks off:
 
 ```bash
-python -c "
-import json,collections
-c=collections.Counter(json.loads(l)['finish'] for l in open('work/candidates.jsonl'))
-print(c)"
+python diagnose.py --prompts full.jsonl --candidates work/candidates.jsonl
 ```
 
-More than ~10% `length` means raise `--max-new-tokens` or `--max-model-len`.
+Section A cross-tabulates finish reason against whether a code block came out, which separates
+the two failure modes that look identical from the outside:
+
+* `finish='length'` + no code -> the token cap cut it off mid-thought. Raise `--max-new-tokens`.
+* `finish='stop'` + no code -> it finished and never emitted a fence. The printed tail shows
+  whether it answered in prose or used a format `extract_code` does not match.
+
+Section B does the same for sample-test parsing. More than ~10% `length` overall means the
+budget is too tight for this model -- it is a long-CoT reasoner and the model card suggests
+100K tokens for hard problems.
 
 ---
 
 ## Troubleshooting
+
+**Generations come out as word salad.** Short broken lines, stray rare tokens, random language
+switching, `finish='stop'` well under the cap. This is a corrupted decode, not a prompt
+problem, and it is usually intermittent -- some rollouts in the same batch are fine. Run:
+
+```bash
+python ablate.py --model /workspace/VibeThinker-3B --prompts full.jsonl
+```
+
+It re-runs one real prompt under transformers alone and under several vLLM configurations,
+each in its own subprocess, and scores each for degeneracy (`< 0.3` healthy, `> 0.5` salad).
+Read the table top-down and take the first clean row:
+
+* `hf_baseline` also bad -> the weights, the prompt or the sampling params, not vLLM.
+* `no_prefix_cache` clean -> pass `--no-prefix-caching` to stages 1 and 3. Prefix caching with
+  `n > 1` shares blocks between forked sequences and had known correctness bugs in this vLLM.
+* `no_async_out` or `eager` clean -> add the matching flag; CUDA graph or async output
+  corruption.
+* only `greedy` / `temp_0.6` clean -> sampling instability; drop temperature, and note in your
+  write-up that you deviated from the paper's `temperature=1.0`.
+
 
 **Context beyond 32K.** Qwen2.5-Coder-3B declares `max_position_embeddings: 32768`, and the
 paper's RL used a 64K window. Check what the checkpoint actually ships:

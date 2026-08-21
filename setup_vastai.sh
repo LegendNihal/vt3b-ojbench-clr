@@ -11,7 +11,7 @@ echo "== system packages =="
 apt-get update -qq
 # g++ compiles the C++ candidates; pypy3 is what OJBench itself uses for Python,
 # so verifying with plain CPython would give you the wrong TLE picture
-apt-get install -y -qq build-essential g++ pypy3 git curl
+apt-get install -y -qq build-essential g++ pypy3 git curl python3-pip python-is-python3
 
 echo "== python packages =="
 # these two versions are known to work together; vllm 0.6.3 pulls torch 2.4.0
@@ -19,6 +19,8 @@ pip install -q "vllm==0.6.3.post1"
 pip install -q "transformers==4.45.2"
 # vllm 0.6.3 predates the numpy 2 ABI break
 pip install -q "numpy<2"
+# transformers needs jinja2>=3.1 for chat templates; some images ship 3.0.x
+pip install -q "jinja2>=3.1.4"
 pip install -q "huggingface_hub[cli]"
 
 echo "== download the model (~6.2 GB) =="
@@ -38,12 +40,19 @@ template renders. Verify it now:
 EOF
 python - <<'PY'
 from transformers import AutoTokenizer
-t = AutoTokenizer.from_pretrained("/workspace/VibeThinker-3B", trust_remote_code=True)
-if t.chat_template is None:
-    print("!! no chat_template found -- see README, section 'If the chat template fails'")
-else:
-    print(t.apply_chat_template([{"role":"user","content":"hi"}],
-                                tokenize=False, add_generation_prompt=True))
+try:
+    t = AutoTokenizer.from_pretrained("/workspace/VibeThinker-3B", trust_remote_code=True)
+    if t.chat_template is None:
+        print("!! no chat_template in the repo -- the pipeline will use its ChatML fallback")
+    else:
+        print(t.apply_chat_template([{"role": "user", "content": "hi"}],
+                                    tokenize=False, add_generation_prompt=True))
+except ImportError as e:
+    print(f"!! {e}")
+    print("!! fix with:  pip install -U 'jinja2>=3.1.4'   then re-run this check")
+except Exception as e:
+    print(f"!! chat template check failed: {e}")
+    print("!! the pipeline falls back to ChatML, but investigate before a long run")
 PY
 
 cat <<'EOF'

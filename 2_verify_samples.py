@@ -35,6 +35,9 @@ def build_args():
     p.add_argument("--samples-out", default="work/samples.jsonl")
     p.add_argument("--samples-override", default=None,
                    help="jsonl of {id, samples:[{input,output}]} to use instead of parsing")
+    p.add_argument("--stress-file", default=None,
+                   help="jsonl of {id, inputs:[...]} from 2c_gen_inputs.py. Inputs with no "
+                        "expected output, used for behavioural clustering only")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--timeout", type=float, default=10.0, help="seconds per sample test")
     p.add_argument("--mem-mb", type=int, default=1024)
@@ -69,6 +72,15 @@ def main():
         print("[warn] low coverage. Tasks without samples fall back to a weaker CLR-only "
               "gate; see the README for how to supply --samples-override.")
 
+    stress = {}
+    if a.stress_file:
+        by_pid = {str(r["id"]): r["inputs"] for r in read_jsonl(a.stress_file)}
+        for k, t in tasks.items():
+            stress[k] = by_pid.get(str(t["id"]), [])
+        n_with = sum(1 for v in stress.values() if v)
+        print(f"[stress] generated inputs for {n_with}/{len(tasks)} tasks "
+              f"({sum(len(v) for v in stress.values())} inputs total)")
+
     py = a.py_cmd or find_pypy3()
     print(f"[runtime] python -> {py or sys.executable}"
           f"{'' if py else '  (pypy3 NOT found; install it, OJBench judges with pypy3)'}")
@@ -95,7 +107,8 @@ def main():
         (key, h), group = item
         if h == "NOCODE":
             res = {"compile_error": "no code block in response", "results": [],
-                   "n_pass": 0, "n_total": 0, "signature": "NOCODE"}
+                   "n_pass": 0, "n_total": 0, "signature": "NOCODE",
+                   "stress_status": [], "n_stress": 0}
         else:
             tests = samples.get(key, [])
             c = group[0]
@@ -103,7 +116,8 @@ def main():
             try:
                 res = run_candidate_on_tests(
                     c["code"], c["language"], tests, wd,
-                    timeout_s=a.timeout, mem_mb=a.mem_mb, py_cmd=py)
+                    timeout_s=a.timeout, mem_mb=a.mem_mb, py_cmd=py,
+                    extra_inputs=stress.get(key))
             finally:
                 shutil.rmtree(wd, ignore_errors=True)
         rows = []
@@ -115,6 +129,8 @@ def main():
                 "n_pass": res["n_pass"], "n_total": res["n_total"],
                 "all_pass": res["n_total"] > 0 and res["n_pass"] == res["n_total"],
                 "signature": res["signature"],
+                "n_stress": res.get("n_stress", 0),
+                "stress_status": res.get("stress_status", []),
                 "first_fail": next(({"i": i, "status": r["status"], "got": r["got"][:600]}
                                     for i, r in enumerate(res["results"]) if not r["passed"]), None),
             })
@@ -143,9 +159,13 @@ def main():
     solved = sum(1 for v in per_task.values() if any(x["all_pass"] for x in v))
     nocode = sum(1 for r in rows if r["code_hash"] == "NOCODE")
     ce = sum(1 for r in rows if r["compile_error"] and r["code_hash"] != "NOCODE")
+    multi = sum(1 for v in per_task.values()
+                if len({x["signature"] for x in v if x["code_hash"] != "NOCODE"}) > 1)
     print(f"\n[done] {out_path}")
     print(f"  tasks with >=1 candidate passing all statement samples: {solved}/{len(per_task)}")
-    print(f"  candidates with no code block: {nocode} | compile errors: {ce}")
+    print(f"  candidates with no code block: {nocode} | compile/syntax errors: {ce}")
+    print(f"  tasks where candidates split into >1 behaviour: {multi}/{len(per_task)}"
+          "   <- clustering only helps where this is true")
     print("  (this is an upper-bound sanity signal, NOT the OJBench score)")
     if not a.tmp:
         shutil.rmtree(root, ignore_errors=True)

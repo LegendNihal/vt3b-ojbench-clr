@@ -9,6 +9,7 @@ TOPN=${TOPN:-6}                # programs per task that get the CLR treatment
 MAXLEN=${MAXLEN:-32768}
 WORKERS=${WORKERS:-8}          # CPU threads for the sandbox
 BASELINE_ROLLOUTS=${BASELINE_ROLLOUTS:-8}
+N_INPUTS=${N_INPUTS:-6}      # generated inputs per problem
 
 mkdir -p work logs
 
@@ -18,10 +19,17 @@ python 1_generate.py \
   --k "$K" --max-model-len "$MAXLEN" --max-new-tokens $((MAXLEN - 6144)) \
   2>&1 | tee -a logs/1_generate.log
 
-echo "### stage 2: execution gate on the statement samples"
+echo "### stage 2c: input generators (OJBench strips NOI samples, so this is"
+echo "###            the only execution signal on 159 of the 232 problems)"
+python 2c_gen_inputs.py \
+  --model "$MODEL" --prompts "$PROMPTS" --out work/stress.jsonl \
+  --n-inputs "$N_INPUTS" --max-model-len "$MAXLEN" \
+  2>&1 | tee -a logs/2c_gen.log
+
+echo "### stage 2: execution gate + behavioural signatures"
 python 2_verify_samples.py \
   --prompts "$PROMPTS" --candidates work/candidates.jsonl \
-  --out work/verify.jsonl --workers "$WORKERS" \
+  --out work/verify.jsonl --workers "$WORKERS" --stress-file work/stress.jsonl \
   2>&1 | tee -a logs/2_verify.log
 
 echo "### stage 3: claim-level reliability assessment"

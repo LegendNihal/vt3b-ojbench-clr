@@ -33,8 +33,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from common import (load_tokenizer, parse_last_json, read_jsonl, render_chat, task_key,
-                    write_jsonl)
+from common import (load_tokenizer, parse_last_json, parse_verdicts, read_jsonl,
+                    render_chat, task_key, write_jsonl)
 
 M_CLAIMS = 5
 
@@ -98,8 +98,8 @@ def build_args():
                    help="distinct programs per task that get the full CLR treatment")
     p.add_argument("--problem-chars", type=int, default=9000, help="statement budget in the CLR prompt")
     p.add_argument("--code-chars", type=int, default=7000)
-    p.add_argument("--extract-tokens", type=int, default=6144)
-    p.add_argument("--verify-tokens", type=int, default=8192)
+    p.add_argument("--extract-tokens", type=int, default=8192)
+    p.add_argument("--verify-tokens", type=int, default=12288)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--seed", type=int, default=7)
@@ -114,6 +114,9 @@ def build_args():
     p.add_argument("--gate-nosamples", type=float, default=0.6, help="weight when no samples exist")
     p.add_argument("--gate-fail", type=float, default=0.12,
                    help="weight for sample-failing candidates (only used if nothing passes)")
+    p.add_argument("--stress-floor", type=float, default=0.30,
+                   help="gate multiplier for a candidate that crashes on every valid "
+                        "generated input (1.0 = ignore generated-input evidence)")
     p.add_argument("--alpha", type=float, default=0.25, help="self-consistency bonus per cluster")
     p.add_argument("--parse-fail-score", type=float, default=0.30)
     p.add_argument("--no-llm", action="store_true",
@@ -164,6 +167,23 @@ def main():
         else:
             pool, mode, gate = alive, "degraded", a.gate_fail
 
+        # A generated input that almost everyone crashes on is a bad input, not a
+        # bad program, so only inputs the majority survives count as evidence.
+        n_stress = max((v.get("n_stress", 0) for _, v in pool), default=0)
+        stress_ratio = {}
+        if n_stress:
+            need = max(1, len(pool) // 2)
+            valid = [j for j in range(n_stress)
+                     if sum(1 for _, v in pool
+                            if (v.get("stress_status") or [None] * n_stress)[j] == "ok") >= need]
+            for c, v in pool:
+                st = v.get("stress_status") or []
+                if not valid:
+                    stress_ratio[c["idx"]] = 1.0
+                else:
+                    ok = sum(1 for j in valid if j < len(st) and st[j] == "ok")
+                    stress_ratio[c["idx"]] = ok / len(valid)
+
         clusters = defaultdict(list)          # behavioural signature -> [idx...]
         for c, v in pool:
             clusters[v["signature"]].append(c["idx"])
@@ -177,7 +197,8 @@ def main():
         reps = sorted(by_hash.values(),
                       key=lambda cv: (-len(clusters[cv[1]["signature"]]), len(cv[0]["code"])))
         plans[key] = {"pool": reps[: a.top_n], "mode": mode, "gate": gate,
-                      "clusters": dict(clusters), "pool_size": len(pool)}
+                      "clusters": dict(clusters), "pool_size": len(pool),
+                      "stress_ratio": stress_ratio, "n_stress": n_stress}
 
     n_jobs = sum(len(p["pool"]) for p in plans.values())
     print(f"[plan] {len(plans)} tasks, {n_jobs} programs to assess "
@@ -243,12 +264,8 @@ def main():
 
         n_parsed = 0
         for (k, c, v), cl, txt in zip(jobs, claim_sets, r2):
-            js = parse_last_json(txt) or {}
-            vd = js.get("verdicts")
-            if isinstance(vd, list) and len(vd) >= 1:
-                vs = [1 if str(x).strip() in ("1", "True", "true", "yes") else 0
-                      for x in vd][:M_CLAIMS]
-                vs += [0] * (M_CLAIMS - len(vs))
+            vs, worst = parse_verdicts(txt, M_CLAIMS)
+            if vs is not None:
                 # Eq. 5: r = (mean v)^M -- one broken claim collapses the trace
                 r = (sum(vs) / M_CLAIMS) ** M_CLAIMS
                 n_parsed += 1
@@ -258,7 +275,7 @@ def main():
             reliability[(k, c["idx"])] = r
             traces.append({"key": k, "idx": c["idx"], "claims": cl, "verdicts": vs,
                            "parsed": ok, "reliability": round(r, 4),
-                           "worst_issue": str(js.get("worst_issue", ""))[:300]})
+                           "worst_issue": worst})
         print(f"      parsed verdicts for {n_parsed}/{len(r2)}")
         write_jsonl(a.trace_out, traces)
     else:
@@ -288,7 +305,9 @@ def main():
         gate = p["gate"]
         scored = defaultdict(float)
         for c, v in p["pool"]:
-            r = gate * reliability.get((key, c["idx"]), 0.0)
+            sr = p["stress_ratio"].get(c["idx"], 1.0) if p["n_stress"] else 1.0
+            g = gate * (a.stress_floor + (1.0 - a.stress_floor) * sr)
+            r = g * reliability.get((key, c["idx"]), 0.0)
             scored[v["signature"]] += r
         k_total = max(len(by_task[key]), 1)
         for sig, members in p["clusters"].items():
@@ -310,7 +329,9 @@ def main():
             "score": round(scored[best_sig], 4), "reliability": round(best_r, 4),
             "cluster_size": len(p["clusters"].get(best_sig, [])),
             "n_clusters": len(p["clusters"]), "n_candidates": len(by_task[key]),
-            "assessed": len(p["pool"]),
+            "assessed": len(p["pool"]), "n_stress": p["n_stress"],
+            "stress_ratio": round(p["stress_ratio"].get(best_idx, 1.0), 3)
+                            if p["n_stress"] else None,
         })
 
     write_jsonl(a.out, selections)
