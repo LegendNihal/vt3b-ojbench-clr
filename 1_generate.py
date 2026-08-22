@@ -53,8 +53,11 @@ def build_args():
                    help="eager mode frees the 1-3 GiB CUDA graphs would use, "
                         "so this can go higher than the usual 0.90")
     p.add_argument("--max-num-seqs", type=int, default=48,
-                   help="auto-lowered at startup to whatever the KV cache "
-                        "actually holds")
+                   help="auto-tuned at startup from real KV capacity")
+    p.add_argument("--kv-overcommit", type=float, default=1.5,
+                   help="multiplier on the auto-computed concurrency. Most rollouts finish "
+                        "well under the cap, and preemption now recomputes rather than swaps, "
+                        "so overcommitting is safe and buys throughput. 1.0 = no overcommit")
     p.add_argument("--swap-space", type=int, default=16,
                    help="GiB of CPU swap. Only used if preemption still happens")
     p.add_argument("--fork-n", action="store_true",
@@ -216,15 +219,13 @@ def main():
         cc = llm.llm_engine.cache_config
         kv_tokens = (cc.num_gpu_blocks or 0) * cc.block_size
         est_per_seq = min(a.max_model_len, a.max_new_tokens + 4096)
-        safe = max(4, int(0.9 * kv_tokens / max(est_per_seq, 1)))
+        safe = max(4, int(0.9 * kv_tokens / max(est_per_seq, 1) * a.kv_overcommit))
         cur = llm.llm_engine.scheduler_config.max_num_seqs
-        print(f"[kv] {kv_tokens} tokens of cache, ~{est_per_seq} per sequence "
-              f"-> room for ~{safe} concurrent")
-        if safe < cur:
+        print(f"[kv] {kv_tokens} tokens of cache, ~{est_per_seq} per sequence, "
+              f"overcommit {a.kv_overcommit}x -> {safe} concurrent")
+        if safe != cur:
             llm.llm_engine.scheduler_config.max_num_seqs = safe
-            print(f"[kv] lowering --max-num-seqs {cur} -> {safe} to stay off the "
-                  f"preemption path (raise --gpu-mem-util or use --kv-cache-dtype "
-                  f"fp8 for more room)")
+            print(f"[kv] setting --max-num-seqs {cur} -> {safe}")
     except Exception as e:
         print(f"[kv] could not auto-tune max_num_seqs ({e}); watch for preemption warnings")
 
