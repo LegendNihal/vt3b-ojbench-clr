@@ -10,7 +10,7 @@ import collections
 import json
 import re
 
-from common import parse_samples, read_jsonl, task_key
+from common import code_looks_valid, parse_samples, read_jsonl, task_key
 
 
 def build_args():
@@ -35,7 +35,14 @@ def diagnose_candidates(path, show, tail_chars):
     both = collections.Counter((r.get("finish"), r.get("code") is not None) for r in rows)
     toks = sorted(r.get("n_tokens", 0) for r in rows)
 
+    nvalid = sum(1 for r in rows
+                 if r.get("valid", code_looks_valid(r.get("code"), r.get("language", "python"))))
+    ncode = sum(1 for r in rows if r.get("code"))
     print(f"  {len(rows)} samples")
+    print(f"  USABLE programs       : {nvalid}/{len(rows)} ({100*nvalid/len(rows):.0f}%)"
+          f"   <- the number that matters")
+    print(f"  had any code block    : {ncode}/{len(rows)}"
+          f"   (the gap is fragments salvaged from truncated fences)")
     print(f"  finish reasons        : {dict(fin)}")
     print(f"  (finish, has_code)    : {dict(both)}")
     print(f"  tokens min/med/max    : {toks[0]} / {toks[len(toks)//2]} / {toks[-1]}")
@@ -59,6 +66,32 @@ def diagnose_candidates(path, show, tail_chars):
         total = sum(r.get("n_tokens", 0) for r in rows)
         print(f"  tokens spent on truncated rollouts: {waste}/{total} "
               f"({100*waste/max(total,1):.0f}% of all compute)")
+
+        cap_now = max(r.get("n_tokens", 0) for r in rows)
+        print(f"""
+  Yield curve. What WOULD have happened at a smaller cap, computed exactly from
+  these rollouts: a rollout that finished at 20k yields nothing under a 16k cap
+  but still costs 16k. Pick the cap with the lowest tokens/usable -- that is the
+  cheapest way to buy a candidate. If the minimum sits at the current cap, the
+  cap is still binding and trimming will not help.""")
+        print(f"\n  {'cap':>8}{'usable':>9}{'Mtokens':>10}{'tokens/usable':>16}")
+        best = None
+        for frac in (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+            C = int(cap_now * frac)
+            ok = sum(1 for r in rows if r.get("finish") == "stop" and r.get("code")
+                     and r.get("n_tokens", 0) <= C)
+            cost = sum(min(r.get("n_tokens", 0), C) for r in rows)
+            per = cost / ok if ok else float("inf")
+            mark = ""
+            if ok and (best is None or per < best[1]):
+                best, mark = (C, per), ""
+            print(f"  {C:>8}{ok:>9}{cost/1e6:>10.2f}{(per if ok else 0):>16.0f}"
+                  f"{'  <- cheapest' if ok and per == min(per, best[1]) else ''}")
+        if best:
+            print(f"\n  cheapest cap in this range: {best[0]} at {best[1]:.0f} tokens/usable")
+            if best[0] >= cap_now:
+                print("  -> the minimum is at your current cap, so the cap is still binding. "
+                      "Raise it if you have context headroom; do not trim.")
 
     print("""
   How to read this:

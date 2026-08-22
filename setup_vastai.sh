@@ -11,7 +11,7 @@ echo "== system packages =="
 apt-get update -qq
 # g++ compiles the C++ candidates; pypy3 is what OJBench itself uses for Python,
 # so verifying with plain CPython would give you the wrong TLE picture
-apt-get install -y -qq build-essential g++ pypy3 git curl
+apt-get install -y -qq build-essential g++ pypy3 git curl python3-pip python-is-python3
 
 echo "== python packages =="
 # these two versions are known to work together; vllm 0.6.3 pulls torch 2.4.0

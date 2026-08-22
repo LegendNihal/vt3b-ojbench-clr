@@ -87,6 +87,26 @@ def extract_code(text, language):
     return code if code.strip() else None
 
 
+def code_looks_valid(code, language):
+    """Is this a plausibly complete program, or a fragment salvaged from a
+    truncated fence? "Has a code block" massively overstates yield when most
+    rollouts are cut off mid-answer."""
+    if not code or not code.strip():
+        return False
+    if language == "python":
+        try:
+            compile(code, "main.py", "exec")
+            return True
+        except (SyntaxError, ValueError):
+            return False
+    if "main" not in code:
+        return False
+    for o, c in (("{", "}"), ("(", ")")):
+        if code.count(o) != code.count(c):
+            return False
+    return True
+
+
 def code_hash(code):
     """Hash that ignores whitespace-only differences, so trivial duplicates collapse."""
     squeezed = re.sub(r"\s+", " ", code or "").strip()
@@ -153,10 +173,62 @@ def _block_after(text, start):
     return "\n".join(out), False
 
 
+# Every OJBench prompt ends with an answer template that contains a ```python
+# skeleton. Sample parsers will happily pair a real sample input with that
+# skeleton and call it the expected output, which then fails every correct
+# program. Cut the statement before it.
+_FORMAT_CUT = re.compile(r"\n#{1,6}\s*Format\s*:", re.I)
+
+# statements whose samples were replaced with placeholders carry no real tests
+_PLACEHOLDER = re.compile(
+    r"(<\s*insert[^>]*>|\[\s*Example\s+(Input|Output)\s*\]|<\s*Your code is here\s*>"
+    r"|\[\s*your code here\s*\])", re.I)
+
+# an expected output that is source code is a parser failure, never a real sample
+_LOOKS_LIKE_CODE = re.compile(
+    r"(def\s+main\s*\(|if\s+__name__|#include\s*<|int\s+main\s*\(|public\s+static\s+void)")
+
+_CODE_TAGS = {"python", "python3", "py", "cpp", "c++", "c", "java", "javascript", "js", "rust", "go"}
+
+# some statements put both halves in one fence: "Input:\n...\nOutput:\n..."
+_INLINE_IO = re.compile(r"^\s*Input\s*:?\s*\n(?P<in>.*?)\n\s*Output\s*:?\s*\n(?P<out>.*)$",
+                        re.S | re.I)
+
+
+def _statement_body(prompt):
+    m = _FORMAT_CUT.search(prompt or "")
+    return prompt[: m.start()] if m else (prompt or "")
+
+
+def _reject(pair):
+    """True if this parsed pair cannot possibly be a real sample test."""
+    i, o = pair.get("input", ""), pair.get("output", "")
+    for side in (i, o):
+        if not side.strip():
+            return True
+        if not re.search(r"[A-Za-z0-9]", side):     # only backticks/brackets/dashes
+            return True
+        if _PLACEHOLDER.search(side):
+            return True
+    if _LOOKS_LIKE_CODE.search(o):
+        return True
+    return False
+
+
+def _split_inline_io(pair):
+    """'Input:\n3\nOutput:\n6' captured as one side -> split it properly."""
+    m = _INLINE_IO.match(pair.get("input", "") or "")
+    if m and m.group("out").strip():
+        return {"input": m.group("in").rstrip() + "\n",
+                "output": m.group("out").rstrip() + "\n",
+                "fenced": pair.get("fenced", False)}
+    return pair
+
+
 _BARE_IN = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Input|输入)[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
 _BARE_OUT = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Output|输出)[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
 _EXAMPLE_HDR = re.compile(r"^[ \t]*#{2,6}[ \t]*(?:Example|Sample|样例|例)s?[ \t]*#?\s*\d*[ \t]*$", re.I | re.M)
-_FENCE_BLOCK = re.compile(r"```[A-Za-z0-9_+#.\-]*[ \t]*\r?\n(.*?)```", re.S)
+_FENCE_BLOCK = re.compile(r"```([A-Za-z0-9_+#.\-]*)[ \t]*\r?\n(.*?)```", re.S)
 
 
 def _parse_bare_pairs(prompt):
@@ -186,8 +258,13 @@ def _parse_example_section(prompt):
         rest = prompt[m.end():]
         nxt = _EXAMPLE_HDR.search(rest)
         chunk = rest[: nxt.start()] if nxt else rest[:4000]
-        blocks = _FENCE_BLOCK.findall(chunk)
-        if len(blocks) == 2 and blocks[0].strip() and blocks[1].strip():
+        blocks = [c for tag, c in _FENCE_BLOCK.findall(chunk)
+                  if tag.lower() not in _CODE_TAGS and c.strip()]
+        if len(blocks) == 1:
+            one = _split_inline_io({"input": blocks[0], "fenced": True})
+            if "output" in one:
+                pairs.append(one)
+        elif len(blocks) == 2:
             pairs.append({"input": blocks[0].rstrip() + "\n",
                           "output": blocks[1].rstrip() + "\n", "fenced": True})
     return pairs
@@ -196,6 +273,12 @@ def _parse_example_section(prompt):
 def parse_samples(prompt):
     """Return [{'input': str, 'output': str}, ...] parsed from a statement."""
     if not prompt:
+        return []
+    prompt = _statement_body(prompt)
+    # A statement whose samples were stubbed out ("<insert example input here>",
+    # "[Example Input]") has no real tests. Those markers also happen to match the
+    # sample-header patterns, so bail before parsing rather than filter after.
+    if _PLACEHOLDER.search(prompt):
         return []
     hits = []
     for m in _HDR_RE.finditer(prompt):
@@ -216,6 +299,9 @@ def parse_samples(prompt):
         pairs = _parse_bare_pairs(prompt)
     if not pairs:
         pairs = _parse_example_section(prompt)
+
+    pairs = [_split_inline_io(p) for p in pairs]
+    pairs = [p for p in pairs if not _reject(p)]
 
     # de-duplicate while preserving order
     seen, uniq = set(), []

@@ -156,6 +156,50 @@ Then judge `smoke.jsonl` on WSL2 to confirm the round trip works before committi
 
 ---
 
+## Before the full run
+
+**Prove the gate works, free.**
+
+```bash
+python test_gate.py --samples work/samples.jsonl --prompts full.jsonl
+```
+
+Builds synthetic candidates for tasks whose samples parsed -- one printing the known-correct
+output, one printing junk, one syntactically broken -- runs the real stages 2 and 3, and checks
+that the correct one passes, the wrong one fails, mode is `gated`, and index 0 is selected. It
+separates "is the gate wired correctly" from "can the model write code", which every real smoke
+run confounds. A PASS means any `gated: 0` you see later is a generation problem, not a
+pipeline problem.
+
+
+Two checks that no amount of staring at code substitutes for.
+
+**1. Exercise the execution gate on ICPC.** NOI has almost no statement samples, so a smoke run
+that only covers NOI never tests the gate at all -- it lands entirely in `nosamples` mode.
+
+```bash
+DATASETS=icpc NTASKS=8 K=4 bash smoke.sh
+```
+
+Check `3b. tasks WITH samples that reached 'gated'`. If that is 0, either every rollout is
+wrong or the parsed expected outputs are wrong, and the gate is worse than useless -- it would
+reject correct programs. Open `work/smoke/samples.jsonl` and compare two entries against the
+real statements before going further.
+
+**2. Judge something.** If OJBench cannot extract code from `content`, the whole run is wasted
+at the last step.
+
+```bash
+scp ... smoke_response.jsonl
+python -c "import ojbench;from pathlib import Path;ojbench.init(problem_dirs=[Path('OJBench_testdata/NOI'),Path('OJBench_testdata/ICPC')]);ojbench.judge_jsonl('smoke_response.jsonl','judged_smoke.jsonl',num_workers=8)"
+python score.py judged_smoke.jsonl
+```
+
+Most rows are placeholders, so the score is meaningless -- that is not what you are looking at.
+Look at the verdict distribution `score.py` prints. A healthy run shows a mix (`AC`, `WA`,
+`TLE`). If every row carries the same verdict, OJBench is not seeing your code and `score.py`
+says so explicitly.
+
 ## Full run
 
 ```bash
@@ -176,58 +220,92 @@ python 1_generate.py --model /workspace/VibeThinker-3B --prompts full.jsonl \
 
 ## Budgeting the run
 
-Measure before committing. A smoke run of 8 tasks x K=4 took 16.5 minutes at 609 tok/s with
-~18,800 tokens per sample, which extrapolates to **~32 h at K=8 and ~64 h at K=16** for all
-464 tasks. That is not viable on one 4090, and the fix is not patience -- it is that most of
-those tokens are being thrown away.
+Measure before committing. On one 4090, a smoke run of 8 tasks x K=4 with a 26000-token cap
+took 16.5 min at 609 tok/s, averaging ~18,800 tokens per sample. That extrapolates to **~32 h
+at K=8** for all 464 tasks, which is not viable. Two things fix it.
 
-**Step 1: find out what a successful rollout costs.**
+### 1. fp8 KV cache
 
-```bash
-python diagnose.py --candidates work/smoke/cand.jsonl --prompts full.jsonl
+Decode here is bound by KV cache, not compute. fp8 halves it:
+
+```
+config          deg_all  deg_tail   tok/s   GPU blocks  concurrency
+eager             0.079     0.105   305.8       22781        11.12x
+eager_fp8         0.133     0.108   396.9       45563        22.25x
+eager_mem95       0.079     0.105   298.9       24922        12.17x
 ```
 
-Section A now prints the p50/p75/p90 token count of rollouts that *finished and produced code*,
-plus the share of total compute spent on truncated ones. Truncated rollouts yield nothing --
-no code block, so they never enter the candidate pool -- and they are the most expensive
-samples in the run, because each one burns the full cap.
+`deg_tail` is unchanged, so quality holds. Take fp8, skip `mem95` (9% more blocks, no
+throughput). Add `--kv-cache-dtype fp8` to stages 1, 2c and 3.
 
-Set `--max-new-tokens` a little above that p90. Beyond it you are paying for rollouts that were
-never going to finish. Below it you are cutting off ones that would have.
+Two caveats. The +30% understates it: that benchmark ran six sequences, which never touched the
+concurrency ceiling, so the gain there was pure memory bandwidth -- a real run at 30+ concurrent
+gets the 2x capacity on top. And vLLM logs *"Cannot use FlashAttention-2 backend for FP8 KV
+cache"* and falls back to XFormers, giving back some of the win. `VLLM_ATTENTION_BACKEND=FLASHINFER`
+would recover it, but installing flashinfer against torch 2.4 / vllm 0.6.3 risks the working
+environment; not worth it unless you are comfortable rebuilding.
 
-**Step 2: check whether fp8 KV cache buys you concurrency.**
+### 2. Two-pass generation
 
-Throughput here is bound by KV cache, not compute: 22781 blocks = 364k tokens, so at a 26k cap
-only ~14 sequences fit and a 3B model is nowhere near compute-bound at batch 14. fp8 roughly
-doubles capacity. The catch is that vLLM falls back to a scaling factor of 1.0 when the
-checkpoint ships no calibration, which can quietly degrade quality -- so measure it the same
-way the CUDA graph bug was found:
+Run `diagnose.py` on your smoke candidates and look at the token percentiles. Ours came out:
 
-```bash
-python ablate.py --configs speed --max-tokens 14000
+```
+p50 11870   p75 16029   p90 25815   max 25960      (cap was 26000)
 ```
 
-That compares `eager`, `eager_fp8` and `eager_mem95` on both degeneracy and tok/s. Take fp8
-only if `deg_tail` stays under ~0.3. If it does, add `--kv-cache-dtype fp8` and raise
-`--max-num-seqs` to match the new capacity.
+**p90 sitting on the cap means the distribution is censored** -- those are not near misses.
+The truncated rollouts were still coherently enumerating test cases at token 26000 and would
+have needed 40k or 60k.
 
-**Step 3: pick K against the measured rate.** Once stage 1 prints its ETA after the first
-chunk, that number is real. Options, roughly in order of preference:
+Do not read a p75 off censored data and cut the cap to it. Measured, on this model:
 
-* Shard across two or three rented GPUs: `--shard 0/2` and `--shard 1/2`, then `cat` the
-  candidate files. Linear and safe.
-* Drop to K=4. Best-of-4 with a working execution gate still beats pass@1 comfortably; the
-  gain from K is logarithmic, the cost is linear.
-* Trim the token cap per step 1.
+| cap | truncated | code-block rate | tokens per usable candidate |
+|---|---|---|---|
+| 26000 | 47% | 66% | ~28,650 |
+| 16000 | 88% | 38% | ~40,700 |
+
+Cutting the cap made every usable candidate *more* expensive, not less, because a large part
+of the distribution lives between 16k and 26k. Keep the cap at 26000 or higher. If you have
+context to spare, higher is better -- this model was RL-trained at 64K and its own model card
+suggests six-figure token budgets for hard problems.
+
+Spend the deep budget only where it is needed instead. A wide cheap pass, then a narrow deep
+pass over the tasks that came back empty:
+
+```bash
+# pass 1 -- wide and cheap. ~p75 of successful rollouts.
+python 1_generate.py --model "$MODEL" --prompts full.jsonl --out work/cand_a.jsonl \
+       --k 8 --max-new-tokens 16000 --kv-cache-dtype fp8
+
+# pass 2 -- deep, only tasks pass 1 left with no usable code
+python 1_generate.py --model "$MODEL" --prompts full.jsonl --out work/cand_b.jsonl \
+       --k 4 --max-new-tokens 30000 --kv-cache-dtype fp8 \
+       --only-missing-from work/cand_a.jsonl --idx-offset 100
+
+cat work/cand_a.jsonl work/cand_b.jsonl > work/candidates.jsonl
+```
+
+`--idx-offset` keeps the two passes from colliding on sample index when concatenated. A 16000
+cap also raises concurrency (364k / 16k = 22 sequences, or ~45 with fp8), so pass 1 runs
+considerably faster per token than the smoke run did.
+
+### 3. Then pick K
+
+Stage 1 prints a live ETA after the first chunk. That number is real; this table is not. If it
+still looks too long:
+
+* Shard across two or three rented GPUs (`--shard 0/2`, `--shard 1/2`, then `cat`). Linear and safe.
+* Drop to K=4. The gain from K is logarithmic and the cost is linear, and best-of-4 with a
+  working execution gate still beats pass@1 comfortably.
 
 Do not shrink the benchmark. A score on a subset is not comparable to the paper's 38.6.
 
 **Watch for KV pressure.** `Sequence group N is preempted by PreemptionMode.SWAP` means vLLM
 admitted more sequences than the cache holds and is shuffling KV to host memory. A couple is
-fine; a stream of them means `--max-num-seqs` is above real capacity. Capacity is roughly
-364k / your token cap, so at a 16k cap that is ~22 sequences.
+fine; a stream means `--max-num-seqs` is above real capacity, which is roughly
+(blocks x 16) / your token cap.
 
-**VRAM.****VRAM.** Weights are 6.2 GB. The KV cache costs ~36 KB/token (36 layers × 2 KV heads ×
+**VRAM.****VRAM.****VRAM.** Weights are 6.2 GB. The KV cache costs ~36 KB/token (36 layers × 2 KV heads ×
 128 dim × 2 for K and V × 2 bytes), so at `--gpu-mem-util 0.90` you get roughly 14 GB of
 cache ≈ 390k tokens ≈ a dozen concurrent 32K sequences. That is comfortable. If you hit OOM,
 drop `--max-num-seqs` to 24 before touching anything else.
@@ -313,6 +391,73 @@ budget is too tight for this model -- it is a long-CoT reasoner and the model ca
 ---
 
 ## Troubleshooting
+
+**Always run `check_samples.py` before trusting the gate.**
+
+```bash
+python check_samples.py --samples work/samples.jsonl --prompts full.jsonl
+```
+
+A wrong expected output is worse than no sample: it rejects correct programs and drops the task
+into `degraded`, so CLR ends up ranking noise. Two flags mean stop, not investigate:
+
+* `EXPECTED_OUTPUT_IS_CODE` -- every OJBench prompt ends with an answer template containing a
+  ```python skeleton, and a sample parser will cheerfully pair a real sample input with that
+  skeleton. `parse_samples` now truncates the statement at the `### Format:` marker before
+  parsing anything, which removes the whole class.
+* `PLACEHOLDER_NOT_A_REAL_SAMPLE` -- some statements ship `<insert example input here>` or
+  `[Example Input]` instead of samples. Those markers also match the sample-header patterns, so
+  `parse_samples` bails on any statement containing them rather than filtering afterwards.
+
+Do not read the flag counts alone. The first version of this script reported 205/209 tasks
+clean while two of the four examples it printed for eyeballing had the code skeleton as their
+expected output. Look at the printed pairs.
+
+**Judge yield by usable programs, not code blocks.** `extract_code` salvages content from an
+unterminated fence, so a truncated rollout still "has a code block" while being an unrunnable
+fragment. One measured run had 12/32 with a code block and 1/32 that actually compiled. Stage 1
+now reports usable programs (Python: compiles; C++: has `main` and balanced delimiters) and
+`diagnose.py` shows both numbers with the gap called out.
+
+**Expect coverage to fall after fixing a parser bug, and treat that as progress.** Some of the
+209 tasks that parsed were producing samples that would have rejected every correct program.
+Fewer, trustworthy samples beat more, broken ones -- tasks without samples fall back to
+`nosamples`, which is a weaker gate but an honest one.
+
+
+**`RuntimeError: Aborted due to the lack of CPU swap space`.** vLLM can only preempt a sequence
+group by RECOMPUTE when it has one running sequence; with `n=K` it is forced into SWAP, and SWAP
+aborts the whole run once CPU swap fills. Stage 1 therefore issues K independent `n=1` requests
+per task rather than one `n=K` request -- prefix caching still shares the prompt blocks, so it
+costs almost nothing, and preemption becomes survivable instead of fatal. `--fork-n` restores the
+old behaviour if you ever want it; you probably do not.
+
+Stage 1 also reads the real KV capacity after startup and lowers `--max-num-seqs` to match:
+
+```
+[kv] 385056 tokens of cache, ~20096 per sequence -> room for ~17 concurrent
+[kv] lowering --max-num-seqs 48 -> 17 to stay off the preemption path
+```
+
+If that number is uncomfortably small, lower `--max-new-tokens` (it dominates the estimate) or
+add `--kv-cache-dtype fp8`, which doubles the cache.
+
+
+**Half the benchmark comes out as placeholders.** OJBench's `full.jsonl` writes the dataset
+field as `"NOI"` but `"icpc"` -- inconsistent case. Stage 1's `--datasets` filter therefore
+defaults to empty (keep everything) and matches case-insensitively when you do set it. It also
+prints what it selected:
+
+```
+[select] 464/464 rows | NOI=318/318, icpc=146/146
+```
+
+Check that line before every long run. If a dataset shows `0/N` you get a `[WARN]`, and stage 4
+repeats the check per dataset and language with an `ALL MISSING` flag. The failure is quiet
+otherwise: stage 1 generates a subset, every later stage happily processes all 464 rows, and
+the missing ones become placeholders that judge as wrong answers. Note this hits the ICPC half,
+which is exactly where the execution gate works (99% sample coverage vs 23% on NOI).
+
 
 **Generations come out as word salad.** Short broken lines, stray rare tokens, random language
 switching, `finish='stop'` well under the cap. It appears **partway through** a long

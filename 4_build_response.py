@@ -62,6 +62,7 @@ def main():
 
     keep = a.keep_fields.split(",") if a.keep_fields else None
     rows, stat = [], Counter()
+    by_group = Counter()
 
     for t in tasks:
         k = task_key(t)
@@ -76,9 +77,11 @@ def main():
             else:
                 content = wrap_as_content(c["code"], t["language"])
             stat["ok"] += 1
+            by_group[(str(t.get("dataset")), str(t.get("language")), "ok")] += 1
         else:
             content = PLACEHOLDER
             stat["missing"] += 1
+            by_group[(str(t.get("dataset")), str(t.get("language")), "missing")] += 1
 
         row = {kk: vv for kk, vv in t.items() if (keep is None or kk in keep)}
         row["content"] = content
@@ -89,6 +92,12 @@ def main():
     print(f"[done] {a.out}")
     print(f"  rows: {len(rows)} (full.jsonl has {len(tasks)})")
     print(f"  with a program: {stat['ok']} | placeholder: {stat['missing']}")
+    groups = sorted({(d, l) for d, l, _ in by_group})
+    for d, l in groups:
+        ok = by_group[(d, l, "ok")]
+        tot = ok + by_group[(d, l, "missing")]
+        flag = "   <- ALL MISSING, check stage 1 filters" if ok == 0 else ""
+        print(f"    {d}/{l}: {ok}/{tot}{flag}")
     print(f"  fields: {sorted(rows[0].keys()) if rows else '-'}")
 
     if rows:
